@@ -201,7 +201,9 @@ public class Sender {
 
             // Wait for ACKs; timeout => retransmit from baseAbs
             try {
-                int ackSeq = receiveAckSeq(sock) % 128;
+                int ackSeq = receiveAckSeq(sock);
+                if (ackSeq < 0) continue; // non-ACK packet ignored
+                ackSeq = ackSeq % 128;
 
                 // Compute how far ahead this ACK is from baseSeq (mod 128), then convert to abs
                 int baseSeq = dataPackets.get(baseAbs).getSeqNum() % 128;

@@ -5,25 +5,13 @@ import java.net.*;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * DS-FTP Sender
- *
- * CLI (exact):
- *   java Sender <rcv_ip> <rcv_data_port> <sender_ack_port> <input_file> <timeout_ms> [window_size]
- *
- * - Omit window_size => Stop-and-Wait
- * - Provide window_size => Go-Back-N
- *
- * Spec reminders:
- * - SOT: type 0, seq 0
- * - First DATA: seq 1
- * - EOT: (last DATA seq + 1) mod 128
- * - Timeout: if 3 consecutive timeouts for the same base without progress:
- *   print "Unable to transfer file." and terminate immediately.
- */
+
 public class Sender {
 
     private static final int MAX_PAYLOAD = DSPacket.MAX_PAYLOAD_SIZE; // 124
+
+    /**set to true to see sequence nums **/
+    private static final boolean OUTPUT = true;
 
     public static void main(String[] args) {
         if (args.length != 5 && args.length != 6) {
@@ -83,12 +71,14 @@ public class Sender {
             long startNs = System.nanoTime();
 
             // Handshake: send SOT(0), wait for ACK(0) with retries / failure rule
-            if (!sendControlAndAwaitAck(sock, rcvIp, rcvDataPort, DSPacket.TYPE_SOT, 0, timeoutMs)) {
+            if (OUTPUT) System.out.println("[Sender] --- Handshake ---");
+            if (!sendControlAndAwaitAck(sock, rcvIp, rcvDataPort, DSPacket.TYPE_SOT, 0, timeoutMs, "SOT")) {
                 // sendControlAndAwaitAck already prints error message on critical failure
                 return;
             }
 
             // Transfer data
+            if (OUTPUT) System.out.println("[Sender] --- Data transfer (" + (useGBN ? "GBN, window=" + windowSize : "Stop-and-Wait") + ") ---");
             if (!useGBN) {
                 if (!stopAndWaitTransfer(sock, rcvIp, rcvDataPort, dataPackets)) {
                     return;
@@ -100,7 +90,8 @@ public class Sender {
             }
 
             // Teardown: send EOT(eotSeq), wait for ACK(eotSeq)
-            if (!sendControlAndAwaitAck(sock, rcvIp, rcvDataPort, DSPacket.TYPE_EOT, eotSeq, timeoutMs)) {
+            if (OUTPUT) System.out.println("[Sender] --- Teardown ---");
+            if (!sendControlAndAwaitAck(sock, rcvIp, rcvDataPort, DSPacket.TYPE_EOT, eotSeq, timeoutMs, "EOT")) {
                 return;
             }
 
@@ -133,17 +124,20 @@ public class Sender {
             boolean acked = false;
 
             while (!acked) {
+                if (OUTPUT) System.out.println("[Sender] Sent DATA (seq=" + (p.getSeqNum() % 128) + ")");
                 sendPacket(sock, rcvIp, rcvDataPort, p);
 
                 try {
                     int ackSeq = receiveAckSeq(sock);
                     if ((ackSeq % 128) == (p.getSeqNum() % 128)) {
+                        if (OUTPUT) System.out.println("[Sender] Received ACK(" + ackSeq + ")");
                         acked = true;
                         timeoutsForCurrent = 0; // progress
                     }
                     // else ignore stray ACKs
                 } catch (SocketTimeoutException te) {
                     timeoutsForCurrent++;
+                    if (OUTPUT) System.out.println("[Sender] Timeout, retransmitting DATA (seq=" + (p.getSeqNum() % 128) + ") [attempt " + timeoutsForCurrent + "/3]");
                     if (timeoutsForCurrent >= 3) {
                         System.out.println("Unable to transfer file.");
                         return false;
@@ -187,13 +181,17 @@ public class Sender {
 
                     List<DSPacket> perm = ChaosEngine.permutePackets(groupList);
                     for (int k = 0; k < perm.size(); k++) {
-                        sendPacket(sock, rcvIp, rcvDataPort, perm.get(k));
+                        DSPacket pk = perm.get(k);
+                        if (OUTPUT) System.out.println("[Sender] Sent DATA (seq=" + (pk.getSeqNum() % 128) + ")");
+                        sendPacket(sock, rcvIp, rcvDataPort, pk);
                     }
                     nextAbs += 4;
                 } else {
                     // Fewer than 4 left -> send in normal order
                     for (int k = 0; k < group; k++) {
-                        sendPacket(sock, rcvIp, rcvDataPort, dataPackets.get(nextAbs + k));
+                        DSPacket pk = dataPackets.get(nextAbs + k);
+                        if (OUTPUT) System.out.println("[Sender] Sent DATA (seq=" + (pk.getSeqNum() % 128) + ")");
+                        sendPacket(sock, rcvIp, rcvDataPort, pk);
                     }
                     nextAbs += group;
                 }
@@ -215,6 +213,7 @@ public class Sender {
                 if (ackedAbs >= baseAbs && ackedAbs < nextAbs) {
                     int newBase = ackedAbs + 1;
                     if (newBase > baseAbs) {
+                        if (OUTPUT) System.out.println("[Sender] Received ACK(" + ackSeq + ") (window advances)");
                         baseAbs = newBase;
                         timeoutsForBase = 0; // progress resets timeout counter
                     }
@@ -223,6 +222,8 @@ public class Sender {
 
             } catch (SocketTimeoutException te) {
                 timeoutsForBase++;
+                int baseSeq = dataPackets.get(baseAbs).getSeqNum() % 128;
+                if (OUTPUT) System.out.println("[Sender] Timeout, retransmitting window from seq=" + baseSeq + " [attempt " + timeoutsForBase + "/3]");
                 if (timeoutsForBase >= 3) {
                     System.out.println("Unable to transfer file.");
                     return false;
@@ -265,7 +266,7 @@ public class Sender {
     // Handshake/Teardown helper
     // -------------------------
     private static boolean sendControlAndAwaitAck(DatagramSocket sock, InetAddress rcvIp, int rcvDataPort,
-                                                 byte type, int seq, int timeoutMs)
+                                                 byte type, int seq, int timeoutMs, String label)
             throws IOException {
 
         DSPacket ctrl = new DSPacket(type, seq, null);
@@ -274,15 +275,18 @@ public class Sender {
         boolean acked = false;
 
         while (!acked) {
+            if (OUTPUT) System.out.println("[Sender] Sent " + label + " (seq=" + (seq % 128) + ")");
             sendPacket(sock, rcvIp, rcvDataPort, ctrl);
 
             try {
                 int ackSeq = receiveAckSeq(sock);
                 if ((ackSeq % 128) == (seq % 128)) {
+                    if (OUTPUT) System.out.println("[Sender] Received ACK(" + (seq % 128) + ")");
                     acked = true;
                 }
             } catch (SocketTimeoutException te) {
                 timeouts++;
+                if (OUTPUT) System.out.println("[Sender] Timeout, retransmitting " + label + " [attempt " + timeouts + "/3]");
                 if (timeouts >= 3) {
                     System.out.println("Unable to transfer file.");
                     return false;

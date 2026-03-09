@@ -4,24 +4,14 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 
-/**
- * DS-FTP Receiver
- *
- * CLI (exact):
- *   java Receiver <sender_ip> <sender_ack_port> <rcv_data_port> <output_file> <RN>
- *
- * Notes:
- * - Works for Stop-and-Wait and Go-Back-N.
- * - Implements receiver-side ACK dropping via ChaosEngine.shouldDrop(ackCount, RN).
- * - Uses buffering + cumulative ACKs (required for GBN).
- */
+
 public class Receiver {
 
-    /**
-     * Receiver CLI does NOT provide window_size, but the assignment tests GBN with window sizes 20, 40, 80.
-     * Using 80 safely supports those runs (sender won't exceed its own window anyway).
-     */
+  
     private static final int RECEIVE_WINDOW_SIZE = 80; // multiple of 4, <= 128
+
+    
+    private static final boolean OUTPUT = true;
 
     public static void main(String[] args) {
         if (args.length != 5) {
@@ -45,6 +35,7 @@ public class Receiver {
 
         // Receiver protocol state
         boolean connected = false;
+        boolean dataPhaseLogged = false;
         int expectedSeq = 1;      // after SOT(0), first DATA is seq 1
         int lastInOrderAck = 0;   // cumulative ACK = last contiguous delivered seq
         int ackCount = 0;         // "intended ACKs so far" (1-indexed rule implemented by increment-before-send)
@@ -81,6 +72,8 @@ public class Receiver {
                 if (!connected) {
                     // Expect SOT (type 0, seq 0)
                     if (type == DSPacket.TYPE_SOT && seq == 0) {
+                        if (OUTPUT) System.out.println("[Receiver] --- Handshake ---");
+                        if (OUTPUT) System.out.println("[Receiver] Received SOT (seq=0)");
                         fos = new FileOutputStream(outputFile);
 
                         connected = true;
@@ -99,12 +92,18 @@ public class Receiver {
                 if (type == DSPacket.TYPE_SOT) {
                     // If sender retransmits SOT because its ACK was dropped, re-ACK it
                     if (seq == 0) {
+                        if (OUTPUT) System.out.println("[Receiver] Received SOT (seq=0) [retransmit]");
                         ackCount = sendAck(socket, senderIp, senderAckPort, 0, rn, ackCount);
                     }
                     continue;
                 }
 
                 if (type == DSPacket.TYPE_DATA) {
+                    if (OUTPUT && !dataPhaseLogged) {
+                        System.out.println("[Receiver] --- Data transfer ---");
+                        dataPhaseLogged = true;
+                    }
+                    if (OUTPUT) System.out.println("[Receiver] Received DATA (seq=" + seq + ")");
                     if (inWindow(seq, expectedSeq, RECEIVE_WINDOW_SIZE)) {
                         // Buffer if new
                         if (!received[seq]) {
@@ -130,12 +129,15 @@ public class Receiver {
 
                     } else {
                         // Out of window -> discard & re-send last cumulative ACK
+                        if (OUTPUT) System.out.println("[Receiver] Out of window, re-sending ACK(" + lastInOrderAck + ")");
                         ackCount = sendAck(socket, senderIp, senderAckPort, lastInOrderAck, rn, ackCount);
                     }
                     continue;
                 }
 
                 if (type == DSPacket.TYPE_EOT) {
+                    if (OUTPUT) System.out.println("[Receiver] --- Teardown ---");
+                    if (OUTPUT) System.out.println("[Receiver] Received EOT (seq=" + seq + ")");
                     // Only accept EOT if it's exactly the next expected sequence
                     if (seq == expectedSeq) {
                         ackCount = sendAck(socket, senderIp, senderAckPort, seq, rn, ackCount);
@@ -144,9 +146,11 @@ public class Receiver {
                         fos.flush();
                         fos.close();
                         fos = null;
+                        if (OUTPUT) System.out.println("[Receiver] Transfer complete. Output file closed.");
                         break;
                     } else {
                         // Not ready -> re-send cumulative ACK
+                        if (OUTPUT) System.out.println("[Receiver] Not ready for EOT, re-sending ACK(" + lastInOrderAck + ")");
                         ackCount = sendAck(socket, senderIp, senderAckPort, lastInOrderAck, rn, ackCount);
                     }
                     continue;
@@ -223,8 +227,10 @@ public class Receiver {
             byte[] out = ack.toBytes();
             DatagramPacket outPkt = new DatagramPacket(out, out.length, senderIp, senderAckPort);
             socket.send(outPkt);
+            if (OUTPUT) System.out.println("[Receiver] Sent ACK(" + ackSeq + ")");
+        } else {
+            if (OUTPUT) System.out.println("[Receiver] ACK(" + ackSeq + ") dropped (simulated loss, RN=" + rn + ")");
         }
-        // else: simulated loss, do nothing
 
         return newCount;
     }
